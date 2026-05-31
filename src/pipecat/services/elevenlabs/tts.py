@@ -586,6 +586,13 @@ class ElevenLabsTTSService(WebsocketTTSService):
 
         self._output_format = ""  # initialized in start()
         self._voice_settings = self._set_voice_settings()
+        # ElevenLabs multi-stream-input requires voice_settings ONLY on the
+        # connection's first message (then never provided/changed). One socket
+        # hosts many contexts (one per turn), so we must send voice_settings on
+        # the FIRST context after each (re)connect and omit it thereafter —
+        # otherwise the 2nd context trips a 1008 policy violation that kills the
+        # socket mid-call. Reset to False whenever a new websocket connects.
+        self._voice_settings_sent = False
         self._pronunciation_dictionary_locators = _pronunciation_dictionary_locators
 
         self._cumulative_time = 0
@@ -644,23 +651,22 @@ class ElevenLabsTTSService(WebsocketTTSService):
         url_changed = bool(changed.keys() & self.Settings.URL_FIELDS)
         voice_settings_changed = bool(changed.keys() & self.Settings.VOICE_SETTINGS_FIELDS)
 
-        if url_changed:
-            logger.debug(
-                f"URL-level setting changed ({changed.keys() & self.Settings.URL_FIELDS}), "
-                f"reconnecting WebSocket"
+        if url_changed or voice_settings_changed:
+            # Both require a fresh socket: URL fields are in the connect URL, and
+            # voice_settings may only be sent on a connection's FIRST message —
+            # changing them on a live socket (the previous "close context" trick)
+            # re-sends voice_settings on a non-first message and trips a 1008
+            # policy violation. Reconnecting lets the new settings ride the first
+            # message of the new connection (voice_settings_sent resets there).
+            reason = "URL-level setting" if url_changed else "Voice settings"
+            changed_fields = changed.keys() & (
+                self.Settings.URL_FIELDS
+                if url_changed
+                else self.Settings.VOICE_SETTINGS_FIELDS
             )
+            logger.debug(f"{reason} changed ({changed_fields}), reconnecting WebSocket")
             await self._disconnect()
             await self._connect()
-        elif voice_settings_changed:
-            logger.debug(
-                f"Voice settings changed ({changed.keys() & self.Settings.VOICE_SETTINGS_FIELDS}), "
-                f"closing current context to apply changes"
-            )
-            audio_contexts = self.get_audio_contexts()
-            if audio_contexts:
-                for ctx_id in audio_contexts:
-                    await self._close_context(ctx_id)
-                    self._reset_alignment_state(ctx_id)
 
         if not url_changed:
             # Reconnect applies all settings; only warn about fields not handled
@@ -771,6 +777,8 @@ class ElevenLabsTTSService(WebsocketTTSService):
             self._websocket = await websocket_connect(
                 url, max_size=16 * 1024 * 1024, additional_headers={"xi-api-key": self._api_key}
             )
+            # Fresh connection → voice_settings must ride on its first message.
+            self._voice_settings_sent = False
 
             await self._call_event_handler("on_connected")
         except Exception as e:
@@ -971,10 +979,15 @@ class ElevenLabsTTSService(WebsocketTTSService):
                     self._partial_word = ""
                     self._partial_word_start_time = 0.0
 
-                    # Initialize context with voice settings and pronunciation dictionaries
+                    # Initialize context. voice_settings may ONLY appear on the
+                    # connection's first message (multi-stream-input rule), so
+                    # send it on the first context after connect and never again
+                    # on this socket — re-sending it trips a 1008 policy
+                    # violation that closes the socket mid-call.
                     msg: dict[str, Any] = {"text": " ", "context_id": context_id}
-                    if self._voice_settings:
+                    if self._voice_settings and not self._voice_settings_sent:
                         msg["voice_settings"] = self._voice_settings
+                        self._voice_settings_sent = True
                     if self._pronunciation_dictionary_locators:
                         msg["pronunciation_dictionary_locators"] = [
                             locator.model_dump()
