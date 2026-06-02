@@ -1084,6 +1084,16 @@ class LLMAssistantAggregator(LLMContextAggregator):
 
         self._assistant_turn_start_timestamp = ""
 
+        # Barge-in straggler guard. On interruption we reset() the aggregation,
+        # but in-flight TTS word frames from the CANCELLED response keep arriving
+        # and would re-populate the buffer, interleaving with the NEXT response's
+        # words — producing garbled assistant text in the LLM context (e.g.
+        # "Actually, Perfect. let me confirm Can you give me…"). While True, we
+        # drop incoming text frames until the next response genuinely starts
+        # (LLMFullResponseStartFrame reopens the gate). The greeting at call
+        # start is unaffected: no prior interruption, so the gate stays open.
+        self._drop_text_until_response_start = False
+
         self._thought_append_to_context = False
         self._thought_llm: str = ""
         self._thought_aggregation: list[TextPartForConcatenation] = []
@@ -1273,6 +1283,9 @@ class LLMAssistantAggregator(LLMContextAggregator):
     async def _handle_interruptions(self, frame: InterruptionFrame):
         await self._trigger_assistant_turn_stopped(interrupted=True)
         await self.reset()
+        # Stop accepting text until a new response starts, so stragglers from the
+        # interrupted response can't bleed into the next aggregation.
+        self._drop_text_until_response_start = True
 
     async def _handle_end_or_cancel(self, frame: Frame):
         await self._trigger_assistant_turn_stopped(interrupted=isinstance(frame, CancelFrame))
@@ -1498,6 +1511,9 @@ class LLMAssistantAggregator(LLMContextAggregator):
             )
 
     async def _handle_llm_start(self, _: LLMFullResponseStartFrame):
+        # A genuinely new response is beginning — resume accepting text frames
+        # (closes the barge-in straggler guard set in _handle_interruptions).
+        self._drop_text_until_response_start = False
         await self._trigger_assistant_turn_started()
 
     async def _handle_llm_end(self, _: LLMFullResponseEndFrame):
@@ -1517,6 +1533,12 @@ class LLMAssistantAggregator(LLMContextAggregator):
     async def _handle_text(self, frame: TextFrame):
         # Skip TextFrame types not intended to build the assistant context
         if isinstance(frame, (TranscriptionFrame, TranslationFrame, InterimTranscriptionFrame)):
+            return
+
+        # Drop stragglers from a response that was just interrupted (barge-in):
+        # we wait for the next LLMFullResponseStartFrame before accepting text,
+        # so cancelled-response words can't interleave into the next utterance.
+        if self._drop_text_until_response_start:
             return
 
         if not frame.append_to_context:
