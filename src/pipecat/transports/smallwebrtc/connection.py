@@ -161,19 +161,54 @@ class SmallWebRTCTrack:
         """
         return self._enabled
 
-    async def discard_old_frames(self):
-        """Discard old frames from the track queue to reduce latency."""
+    def _frame_queue(self) -> asyncio.Queue | None:
+        """Return the underlying aiortc receive queue, when available."""
         remote_track = self._track
-        if isinstance(remote_track, RemoteStreamTrack):
-            if not hasattr(remote_track, "_queue") or not isinstance(
-                remote_track._queue, asyncio.Queue
-            ):
-                print("Warning: _queue does not exist or has changed in aiortc.")
-                return
-            logger.debug("Discarding old frames")
-            while not remote_track._queue.empty():
-                remote_track._queue.get_nowait()  # Remove the oldest frame
-                remote_track._queue.task_done()
+        if not isinstance(remote_track, RemoteStreamTrack):
+            return None
+
+        queue = getattr(remote_track, "_queue", None)
+        if not isinstance(queue, asyncio.Queue):
+            logger.warning("RemoteStreamTrack queue does not exist or has changed in aiortc.")
+            return None
+
+        return queue
+
+    def queued_frame_count(self) -> int | None:
+        """Return the number of queued inbound frames if the backend exposes it."""
+        queue = self._frame_queue()
+        return queue.qsize() if queue else None
+
+    async def discard_old_frames(self, *, keep_latest: int = 0) -> int:
+        """Discard stale queued frames, optionally preserving the newest frames.
+
+        Args:
+            keep_latest: Number of newest frames to leave queued. Use 0 to flush
+                the full backlog before a live relay starts.
+
+        Returns:
+            Number of frames discarded.
+        """
+        if keep_latest < 0:
+            raise ValueError("keep_latest must be non-negative")
+
+        queue = self._frame_queue()
+        if not queue:
+            return 0
+
+        dropped = 0
+        frames_to_drop = max(0, queue.qsize() - keep_latest)
+        while dropped < frames_to_drop:
+            queue.get_nowait()
+            queue.task_done()
+            dropped += 1
+
+        if dropped:
+            logger.debug(
+                f"Discarded {dropped} stale {self._track.kind} frames; "
+                f"remaining={queue.qsize()}"
+            )
+        return dropped
 
     async def recv(self) -> Frame | None:
         """Receive the next frame from the track.
