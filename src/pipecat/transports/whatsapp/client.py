@@ -66,6 +66,10 @@ class WhatsAppClient:
         )
         self._whatsapp_secret = whatsapp_secret
         self._ongoing_calls_map: dict[str, SmallWebRTCConnection] = {}
+        # Calls pre-accepted (caller hears ringback) but not yet accepted, keyed
+        # by call id → (sdp_answer, from_). Populated when defer_accept=True and
+        # drained by accept_pending_call() once a counsellor joins the bridge.
+        self._deferred_accepts: dict[str, tuple[str, str]] = {}
 
         # Set default ICE servers if none provided
         if ice_servers is None:
@@ -187,6 +191,7 @@ class WhatsAppClient:
         connection_callback: Callable[[SmallWebRTCConnection], Awaitable[None]] | None = None,
         raw_body: bytes | None = None,
         sha256_signature: str | None = None,
+        defer_accept: bool = False,
     ) -> bool:
         """Handle a webhook request from WhatsApp.
 
@@ -221,7 +226,9 @@ class WhatsAppClient:
                             if call.event == "connect":
                                 logger.debug(f"Processing connect event for call {call.id}")
                                 try:
-                                    connection = await self._handle_connect_event(call)
+                                    connection = await self._handle_connect_event(
+                                        call, defer_accept=defer_accept
+                                    )
 
                                     # Invoke callback if provided
                                     if connection_callback and connection:
@@ -286,7 +293,9 @@ class WhatsAppClient:
             filtered.append(line)
         return "\r\n".join(filtered) + "\r\n"
 
-    async def _handle_connect_event(self, call: WhatsAppConnectCall) -> SmallWebRTCConnection:
+    async def _handle_connect_event(
+        self, call: WhatsAppConnectCall, defer_accept: bool = False
+    ) -> SmallWebRTCConnection:
         """Handle a CONNECT event by establishing WebRTC connection and accepting the call.
 
         This method:
@@ -337,21 +346,30 @@ class WhatsAppClient:
                 logger.error(f"Pre-accept API call failed for call {call.id}: {e}")
                 raise Exception(f"Failed to pre-accept call: {e}")
 
-            # Accept the call
-            try:
-                accept_resp = await self._whatsapp_api.answer_call_to_whatsapp(
-                    call.id, "accept", sdp_answer, call.from_
-                )
-                if not accept_resp.get("success", False):
-                    logger.error(f"Failed to accept call {call.id}: {accept_resp}")
-                    raise Exception(f"Failed to accept call: {accept_resp}")
+            # Accept the call — unless deferred. WhatsApp keeps the caller on
+            # ringback between pre_accept and accept, so deferring accept until a
+            # counsellor joins the bridge is the native "answer-on-join": the
+            # caller rings (not silence) and the leg only connects on accept.
+            if defer_accept:
+                self._deferred_accepts[call.id] = (sdp_answer, call.from_)
+                logger.debug(f"Call {call.id} pre-accepted; accept deferred until join")
+            else:
+                try:
+                    accept_resp = await self._whatsapp_api.answer_call_to_whatsapp(
+                        call.id, "accept", sdp_answer, call.from_
+                    )
+                    if not accept_resp.get("success", False):
+                        logger.error(f"Failed to accept call {call.id}: {accept_resp}")
+                        raise Exception(f"Failed to accept call: {accept_resp}")
 
-                logger.debug(f"Accept successful for call {call.id}")
-            except Exception as e:
-                logger.error(f"Accept API call failed for call {call.id}: {e}")
-                raise Exception(f"Failed to accept call: {e}")
+                    logger.debug(f"Accept successful for call {call.id}")
+                except Exception as e:
+                    logger.error(f"Accept API call failed for call {call.id}: {e}")
+                    raise Exception(f"Failed to accept call: {e}")
 
-            # Store the connection for management
+            # Store the connection for management. Tag the call id on it so the
+            # bridge can drain the deferred accept without threading it through.
+            pipecat_connection.wa_call_id = call.id
             self._ongoing_calls_map[call.id] = pipecat_connection
 
             # Set up disconnect handler
@@ -362,6 +380,7 @@ class WhatsAppClient:
                 )
                 # Clean up from ongoing calls map
                 self._ongoing_calls_map.pop(call.id, None)
+                self._deferred_accepts.pop(call.id, None)
 
             logger.debug(f"WebRTC connection established successfully for call {call.id}")
             return pipecat_connection
@@ -378,6 +397,29 @@ class WhatsAppClient:
 
             logger.error(f"Failed to handle connect event for call {call.id}: {e}")
             raise
+
+    async def accept_pending_call(self, call_id: str) -> None:
+        """Accept a call that was pre-accepted with defer_accept=True.
+
+        Sends the WhatsApp `accept` with the SDP answer captured at pre-accept
+        time, connecting the leg. Idempotent: a call id that is not pending (or
+        already accepted) is a no-op. Call this when a counsellor joins so the
+        caller stops ringing and audio flows.
+        """
+        pending = self._deferred_accepts.pop(call_id, None)
+        if pending is None:
+            logger.debug(f"accept_pending_call: no deferred accept for {call_id} (no-op)")
+            return
+        sdp_answer, from_ = pending
+        accept_resp = await self._whatsapp_api.answer_call_to_whatsapp(
+            call_id, "accept", sdp_answer, from_
+        )
+        if not accept_resp.get("success", False):
+            # Put it back so a retry (or teardown) can find it.
+            self._deferred_accepts[call_id] = pending
+            logger.error(f"Failed to accept deferred call {call_id}: {accept_resp}")
+            raise Exception(f"Failed to accept deferred call: {accept_resp}")
+        logger.debug(f"Deferred accept successful for call {call_id}")
 
     async def _handle_terminate_event(self, call: WhatsAppTerminateCall) -> bool:
         """Handle a TERMINATE event by cleaning up resources and logging call completion.
